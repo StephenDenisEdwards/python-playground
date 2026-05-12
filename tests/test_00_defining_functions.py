@@ -184,3 +184,220 @@ def test_def_args_and_kwargs() -> None:
     # And spread a dict into keyword args with **:
     payload = {"city": "London", "country": "UK"}
     assert make_record(**payload) == {"city": "London", "country": "UK"}
+
+
+# ---------------------------------------------------------------------------
+# 9. Shared mutable object: same scenario, but it actually works
+# ---------------------------------------------------------------------------
+# Above, 'change_msg' tried to "change" a string via reassignment. It can't —
+# strings are immutable, and reassigning a parameter only rebinds the LOCAL
+# name. Below is the same idea, but with a LIST (mutable). Two functions:
+#   * mutate_list   — MUTATES the shared object        -> caller sees it     ✓
+#   * replace_list  — REBINDS the local name to a new list -> caller does NOT ✗
+# Both functions take the same argument; only the *operation* differs.
+
+def mutate_list(items: list[str]) -> None:
+    items.append("STEVE")          # in-place mutation of the SHARED object
+
+def replace_list(items: list[str]) -> None:
+    items = ["STEVE"]              # local rebind only — caller unaffected
+    assert items == ["STEVE"]      # proves the LOCAL name does point at the new list
+
+def test_shared_mutable_object_visible_via_mutation() -> None:
+    caller_list = ["hello"]
+    mutate_list(caller_list)
+    # Caller sees the change because both names pointed at the SAME list,
+    # and .append() modified that object in place.
+    assert caller_list == ["hello", "STEVE"]
+
+    # Reset, then try the rebind version
+    caller_list = ["hello"]
+    replace_list(caller_list)
+    # Caller's name still points at the original list. The function just
+    # pointed its OWN local name at a new list and threw it away on return.
+    assert caller_list == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# 10. The whole topic in plain English
+# ---------------------------------------------------------------------------
+# Two lists. That's it.
+#
+# CANNOT be changed by a function (you must return a new value):
+#     int, float, bool, str, tuple, None, frozenset, bytes
+#
+# CAN be changed by a function (caller sees the change):
+#     list, dict, set, bytearray, your own classes (unless frozen)
+#
+# What "changed by a function" means in code:
+#
+#     def f(thing):
+#         thing.append(1)    # mutating the EXISTING object  -> caller SEES it
+#         thing = something  # pointing 'thing' at a NEW object -> caller does NOT
+#
+# The first line only works if 'thing' is from the second list (mutable).
+# The second line NEVER affects the caller, regardless of the type. Ever.
+#
+# Practical rule, one sentence:
+#   If you pass in a list/dict/set/custom object and the function calls a
+#   method on it (.append, .pop, d["x"] = ..., obj.attr = ...), the caller
+#   sees it. For anything else, return the value.
+#
+# C# analogy:
+#   Mutating a list/dict in Python == calling a method on a C# reference type
+#     without 'ref' (e.g. xs.Add(1)). Caller sees the change.
+#   Reassigning a parameter in Python has NO C# equivalent — there is no
+#     'ref' in Python. To change the caller's variable, return the new value.
+
+# ---- Example A: mutable type + method call -> caller sees it ----------------
+
+def add_to_dict(d: dict[str, int]) -> None:
+    d["new_key"] = 99          # mutation via subscript assignment
+
+def test_dict_mutation_visible_to_caller() -> None:
+    scores = {"alice": 10}
+    add_to_dict(scores)
+    assert scores == {"alice": 10, "new_key": 99}
+
+
+# ---- Example B: mutable type + REBIND -> caller does NOT see it -------------
+
+def replace_dict(d: dict[str, int]) -> None:
+    d = {"new_key": 99}        # local rebind, NOT a mutation
+    assert d == {"new_key": 99}  # the local name does point at the new dict
+
+def test_dict_rebind_invisible_to_caller() -> None:
+    scores = {"alice": 10}
+    replace_dict(scores)
+    # Caller's 'scores' name still bound to the original dict, untouched.
+    assert scores == {"alice": 10}
+
+
+# ---- Example C: custom class -> mutation works just like list/dict ----------
+
+class Counter:
+    def __init__(self) -> None:
+        self.value = 0
+
+def bump(c: Counter) -> None:
+    c.value += 1              # mutating an ATTRIBUTE on the shared object
+
+def test_custom_object_mutation_visible_to_caller() -> None:
+    c = Counter()
+    bump(c)
+    bump(c)
+    assert c.value == 2
+
+
+# ---- Example D: immutable type -> caller NEVER sees a change ----------------
+
+def try_to_increment(n: int) -> None:
+    n += 1                    # rebind in disguise — ints are immutable
+    n = 999                   # explicit rebind
+    assert n == 999           # local 'n' is 999...
+
+def test_int_cannot_be_changed_by_caller() -> None:
+    x = 10
+    try_to_increment(x)
+    assert x == 10            # ...but caller's x is still 10. Return it instead.
+
+
+# ---- Example E: the only way to "change" an immutable -> return it ----------
+
+def increment(n: int) -> int:
+    return n + 1              # new int, caller does the rebind
+
+def test_immutables_change_by_returning() -> None:
+    x = 10
+    x = increment(x)          # caller reassigns its own name
+    assert x == 11
+
+
+# ---------------------------------------------------------------------------
+# 11. Joining strings: '+', f-strings, and str.join
+# ---------------------------------------------------------------------------
+# str.join has a famously unintuitive shape:
+#     SEPARATOR.join(ITERABLE_OF_STRINGS)
+# i.e. the string you call it on is the SEPARATOR, and the argument is the
+# iterable to glue together. C# is the other way around:
+#     string.Join(separator, items)
+#
+# Rule of thumb:
+#   * Fixed, small number of pieces known at write-time -> use '+' or f-string.
+#   * Variable / unknown / large number of pieces       -> use str.join.
+#
+# The performance reason for join:
+#   Strings are immutable. 'result += x' in a loop allocates a NEW string and
+#   copies the accumulated content each time — O(n^2) overall. 'sep.join(seq)'
+#   does it in a single pass with one allocation. (C# answer: StringBuilder.)
+
+# ---- Example A: '+' and f-strings for simple concatenation ------------------
+
+def test_simple_concatenation_with_plus_and_fstrings() -> None:
+    a = "hello"
+    b = "STEVE"
+    assert a + b == "helloSTEVE"            # '+' just sticks them together
+    assert f"{a}{b}" == "helloSTEVE"        # f-string, no separator
+    assert f"{a} {b}" == "hello STEVE"      # f-string with a literal space
+
+
+# ---- Example B: join shines when the count is variable ----------------------
+
+def format_tags(tags: list[str]) -> str:
+    return ", ".join(tags)                  # handles empty and single-item lists for free
+
+def test_join_handles_variable_counts() -> None:
+    assert format_tags(["python", "testing", "csharp"]) == "python, testing, csharp"
+    assert format_tags(["solo"]) == "solo"          # no trailing separator
+    assert format_tags([]) == ""                    # empty -> empty string
+
+
+# ---- Example C: building a CSV row (the canonical join use case) ------------
+
+def test_join_builds_csv_row() -> None:
+    fields = ["Ada", "36", "London"]
+    assert ",".join(fields) == "Ada,36,London"
+
+
+# ---- Example D: joining non-strings requires converting first ---------------
+
+def test_join_requires_string_elements() -> None:
+    ids = [101, 202, 303]
+
+    # Direct join of ints raises TypeError — unlike C#'s string.Join which
+    # would call .ToString() for you.
+    import pytest
+    with pytest.raises(TypeError):
+        ",".join(ids)                       # type: ignore[arg-type]
+
+    # Two idiomatic conversions:
+    assert ",".join(str(i) for i in ids) == "101,202,303"   # generator expression
+    assert ",".join(map(str, ids)) == "101,202,303"         # map(str, ...)
+
+
+# ---- Example E: join with '\n' to build multi-line text ---------------------
+
+def test_join_builds_multiline_text() -> None:
+    lines = ["def foo():", "    return 42"]
+    assert "\n".join(lines) == "def foo():\n    return 42"
+
+
+# ---- Example F: why join beats += in a loop (the StringBuilder reason) ------
+
+def concat_with_plus(words: list[str]) -> str:
+    """O(n^2). Each += allocates a fresh string and copies the accumulator."""
+    result = ""
+    for w in words:
+        result += w
+    return result
+
+def concat_with_join(words: list[str]) -> str:
+    """O(n). One allocation, one pass. Idiomatic."""
+    return "".join(words)
+
+def test_join_and_plus_produce_the_same_result() -> None:
+    # Same RESULT — the difference is performance, not correctness.
+    # For tiny inputs you'd never notice; for 100k+ pieces it's the difference
+    # between instant and unusable.
+    words = ["word"] * 1000
+    assert concat_with_plus(words) == concat_with_join(words)
