@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Show full output, verbose names, and short tracebacks on failure.
+# `-ra` shows a summary of skipped/xfailed tests too.
+addopts = "-v -ra --tb=short"
+testpaths = ["tests"]
+asyncio_mode = "auto"
