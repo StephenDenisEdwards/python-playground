@@ -1,0 +1,187 @@
+# Async / Await — for C# Developers
+
+Companion notes to [test_07_async.py](test_07_async.py).
+
+The syntax looks identical to C#. The **execution model is not**. This is the single most important thing to internalize before writing async Python:
+
+> Python's `asyncio` runs your coroutines on **a single thread**, inside an **event loop**.
+
+Compare:
+
+| | C# `async`/`await` | Python `asyncio` |
+|---|---|---|
+| Underlying scheduler | Thread-pool (`TaskScheduler`) | Single-threaded **event loop** |
+| Default parallelism | Real multi-core via threads | None — one thread only |
+| CPU-bound work benefits? | Yes (when offloaded to thread pool) | **No** — use `multiprocessing` or `to_thread` |
+| Continuations after `await` | Typically resume on a thread-pool thread | Always resume on the event-loop thread |
+| Library compatibility | Sync and async work together fine | Calling a blocking sync function **freezes the whole loop** |
+
+Why? **The GIL** (Global Interpreter Lock). CPython only runs one Python bytecode at a time per process. `asyncio` doesn't fight the GIL — it gives up trying to use multiple threads for Python code, and instead uses one thread plus cooperative yields to interleave I/O.
+
+The upshot: **async in Python is for I/O concurrency, not CPU parallelism.** For CPU work, reach for `multiprocessing` or `concurrent.futures.ProcessPoolExecutor`.
+
+---
+
+## The mental map
+
+| C# | Python |
+|---|---|
+| `Task<T>` | `Awaitable[T]` / `Coroutine[..., T]` |
+| `Task.WhenAll(...)` | `asyncio.gather(...)` |
+| `Task.Run(...)` | `asyncio.create_task(...)` |
+| `Task.Delay(ms)` | `asyncio.sleep(seconds)` |
+| `CancellationToken` | `asyncio.Task.cancel()` raises `CancelledError` |
+| `Task.WhenAny` | `asyncio.wait(..., return_when=FIRST_COMPLETED)` |
+| `await foo()` | `await foo()` ✓ same |
+
+---
+
+## 1. A basic async function
+
+```python
+async def fetch_value(delay: float, value: int) -> int:
+    await asyncio.sleep(delay)
+    return value
+```
+
+The `async def` keyword makes this a **coroutine function**. Calling it does **not** run the body — it returns a **coroutine object** that you must `await` (or schedule with `create_task` / `gather` / `asyncio.run`):
+
+```python
+fetch_value(0.01, 42)         # returns a coroutine, doesn't run!
+await fetch_value(0.01, 42)   # this actually runs it
+```
+
+`await` can only appear inside an `async def`. The top-level entry point is usually `asyncio.run(main())`.
+
+`pytest-asyncio` detects `async def test_...` and runs each inside an event loop, which is why the tests work without any explicit `asyncio.run`.
+
+---
+
+## 2. `asyncio.gather` ≈ `Task.WhenAll`
+
+The most common concurrent pattern: run several awaitables together and wait for all of them.
+
+```python
+a, b, c = await asyncio.gather(
+    fetch_value(0.05, 1),
+    fetch_value(0.05, 2),
+    fetch_value(0.05, 3),
+)
+```
+
+If each `fetch_value` is "sleeping" (i.e., waiting on I/O), all three sleeps overlap on the single thread — total wall time ≈ slowest one, not the sum. **This only works because `asyncio.sleep` is async.** A plain `time.sleep` would block the event loop and force them to run serially.
+
+`gather` returns results in argument order, regardless of completion order.
+
+### Error handling
+
+By default, the first exception cancels the others and propagates. To collect *all* results (including exceptions), use `return_exceptions=True`:
+
+```python
+results = await asyncio.gather(a(), b(), c(), return_exceptions=True)
+# results may include exception objects instead of raising
+```
+
+---
+
+## 3. `create_task` — fire-and-track
+
+`asyncio.create_task(coro)` schedules the coroutine on the loop *immediately* and returns a `Task` object you can `await` later (or cancel, or check status):
+
+```python
+task = asyncio.create_task(fetch_value(0.01, 7))
+# ... do other work here while the task runs ...
+result = await task
+```
+
+C# parallel: `Task.Run(...)` returning a `Task<T>`. The semantic difference: in C# the work is on a different thread; in Python it's on the same thread, just interleaved.
+
+---
+
+## 4. Cancellation
+
+`task.cancel()` schedules a `CancelledError` to be raised inside the coroutine the next time it suspends. The coroutine can either let it propagate (the default) or catch it to clean up:
+
+```python
+task = asyncio.create_task(asyncio.sleep(10))
+task.cancel()
+with pytest.raises(asyncio.CancelledError):
+    await task
+```
+
+C# parallel: `CancellationToken` — except in Python it's **pushed** from outside (`task.cancel()`) rather than **polled** from inside. Cleanup happens by catching `CancelledError` in a `try/finally`.
+
+**Don't swallow `CancelledError`** — re-raise after cleanup, otherwise the cancellation effectively fails.
+
+---
+
+## 5. Running blocking work without freezing the loop
+
+If you must call a sync function from async code (no async version exists, e.g., a sync database driver), use `asyncio.to_thread`:
+
+```python
+def blocking_compute(n):
+    time.sleep(0.02)
+    return n * n
+
+result = await asyncio.to_thread(blocking_compute, 6)
+```
+
+`to_thread` offloads the call to the default thread pool executor and returns an awaitable. The event loop stays responsive.
+
+**For CPU-bound work**, threads are gated by the GIL — `to_thread` doesn't help. Use `loop.run_in_executor(ProcessPoolExecutor(), ...)` or `multiprocessing` instead.
+
+---
+
+## Common pitfalls
+
+### Forgetting to `await`
+
+```python
+fetch_value(0.01, 42)        # RuntimeWarning: coroutine was never awaited
+```
+
+The coroutine object is created and immediately discarded; the body never runs. Linters and Python itself will warn you about this. If you really mean "kick it off and ignore the result," use `asyncio.create_task(...)` so it has somewhere to run.
+
+### Blocking the loop
+
+```python
+async def bad():
+    time.sleep(5)         # blocks the WHOLE event loop for 5 seconds
+```
+
+`time.sleep` is synchronous and CPU-blocking. So is most of the stdlib I/O (`requests`, `socket.recv`, `open(...).read()`, etc.). Use `asyncio.sleep`, an async-aware library, or `to_thread`.
+
+### Mixing async and sync libraries
+
+You can't just `await` a sync HTTP call. Either:
+- use an async-aware library (`aiohttp`, `httpx` in async mode, `asyncpg`, `aiofiles`); or
+- wrap the sync call with `asyncio.to_thread(sync_fn, args)`.
+
+### Top-level entry point
+
+In an `async def main():` script, you can't just call `main()` — you need to drive the event loop:
+
+```python
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`asyncio.run` creates a loop, runs the coroutine, and closes the loop. Don't create your own loop manually unless you know why.
+
+---
+
+## Quick reference
+
+| Need | C# | Python |
+|---|---|---|
+| Mark function async | `async Task Foo() {}` | `async def foo():` |
+| Suspend on a result | `await task` | `await coro` |
+| Wait for all | `await Task.WhenAll(...)` | `await asyncio.gather(...)` |
+| Wait for first | `await Task.WhenAny(...)` | `asyncio.wait(..., return_when=FIRST_COMPLETED)` |
+| Schedule without awaiting | `Task.Run(...)` | `asyncio.create_task(...)` |
+| Async delay | `Task.Delay(ms)` | `asyncio.sleep(seconds)` |
+| Cancel | `cts.Cancel()` | `task.cancel()` |
+| Run sync work asynchronously | `Task.Run(() => Sync())` | `await asyncio.to_thread(sync, args)` |
+| Entry point | `static async Task Main()` | `asyncio.run(main())` |
+| Use case | I/O **and** CPU parallelism | I/O concurrency **only** |
