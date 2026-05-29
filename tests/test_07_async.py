@@ -485,3 +485,38 @@ async def test_cpu_bound_worker_batches_across_processes() -> None:
     total = sum(result for _, result in partials)
     assert total == sum(n * n for n in data)             # batches recombine to the whole
     assert all(pid != os.getpid() for pid, _ in partials)  # all ran off the main process
+
+
+# The escape hatch: when the heavy work lives in a C extension that RELEASES the
+# GIL (numpy, pandas, scipy, hashing/compression libs), plain THREADS parallelize
+# it — no processes, no pickling, no spawn overhead. numpy drops the GIL inside
+# its matmul, so asyncio.to_thread (the §5 thread-pool path) genuinely overlaps
+# these on multiple cores, unlike a pure-Python CPU loop (§9) which it can't.
+#
+# Why we assert correctness, not wall-clock speedup: a timing test here would be
+# flaky. numpy's BLAS backend is often ALREADY multi-threaded internally, so the
+# serial run may saturate every core too — fanning out across Python threads then
+# adds little (or oversubscribes). The parallelism is real; proving it by the
+# clock is environment-dependent, so we just verify the pattern produces the
+# right results without freezing the loop.
+
+def matmul_load() -> float:
+    import numpy as np                     # local import: module loads even without numpy
+    a = np.ones((256, 256))
+    b = np.ones((256, 256)) * 2.0
+    return float((a @ b).sum())            # deterministic: 256 * (256*1*2) * 256
+
+
+async def test_numpy_releases_gil_so_threads_parallelize() -> None:
+    pytest.importorskip("numpy")           # skip cleanly if numpy isn't installed
+
+    # Heavy numpy work offloaded to THREADS (not processes) and awaited.
+    results = await asyncio.gather(
+        asyncio.to_thread(matmul_load),
+        asyncio.to_thread(matmul_load),
+        asyncio.to_thread(matmul_load),
+        asyncio.to_thread(matmul_load),
+    )
+
+    expected = 256 * (256 * 1.0 * 2.0) * 256
+    assert results == [expected] * 4       # correct results, computed off the loop

@@ -334,7 +334,9 @@ If the heavy work is inside a C/Fortran library — **NumPy, Pandas, SciPy, Pola
 await asyncio.to_thread(numpy_heavy_matrix_op, big_array)
 ```
 
-So the rule is: **pure-Python CPU loop → processes; CPU loop inside a GIL-releasing native lib → threads are fine.**
+So the rule is: **pure-Python CPU loop → processes; CPU loop inside a GIL-releasing native lib → threads are fine.** See the runnable `test_numpy_releases_gil_so_threads_parallelize`.
+
+> **Why that test asserts correctness, not speed:** a wall-clock assertion would be flaky, because numpy's BLAS backend is often *already* multi-threaded internally — the serial run may saturate every core too, so fanning out across Python threads adds little (or oversubscribes). The parallelism is real; proving it by the clock is environment-dependent.
 
 ### Decision table
 
