@@ -392,6 +392,28 @@ Hand-writing the raw C API is the most control but the most boilerplate. For **n
 
 Rule of thumb: wrapping an existing C lib → `ctypes`/`cffi`; new hot-loop code → **Cython** (or **Numba** for numeric, no build step); a new C++/Rust module → **pybind11/nanobind** or **PyO3**; plain array math → just use numpy/scipy.
 
+### 13. A runnable Cython version
+
+`native/sum_squares_cy.pyx` is the same §12 loop, written in Cython instead of raw C — the commonly recommended way to accelerate a hot loop in new code:
+
+```cython
+def sum_squares(long long n):
+    cdef long long total = 0, i
+    with nogil:                 # drop the GIL — same effect as Py_BEGIN_ALLOW_THREADS
+        for i in range(n):
+            total += i * i
+    return total
+```
+
+Build it (needs `pip install Cython` + MSVC):
+
+```
+cd native
+../.venv/Scripts/python.exe setup_cython.py build_ext --inplace
+```
+
+`test_cython_nogil_releases_gil_so_threads_parallelize` then shows it parallelizes across threads exactly like the raw C extension — but with no `PyArg_ParseTuple`, no refcounting, no module boilerplate. The `cdef long long` declarations are the key: they make the loop compile to pure C touching no Python objects, which is also what makes it legal inside `nogil`. (The test skips if the module hasn't been built.)
+
 ---
 
 ## The GIL (Global Interpreter Lock) — in full

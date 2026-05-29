@@ -558,3 +558,37 @@ async def test_c_extension_releases_gil_so_threads_parallelize() -> None:
 
     expected = (n - 1) * n * (2 * n - 1) // 6     # closed form for sum(i*i), i<n
     assert results == [expected] * 4
+
+
+# ---------------------------------------------------------------------------
+# 13. Same thing in Cython — Python-ish source, `nogil` to drop the GIL
+# ---------------------------------------------------------------------------
+# native/sum_squares_cy.pyx is the §12 loop written in Cython instead of raw C.
+# The `with nogil:` block releases the GIL just like Py_BEGIN_ALLOW_THREADS, so
+# it parallelizes across threads too — but with none of the C-API boilerplate.
+# This is the commonly recommended way to accelerate a hot loop in new code.
+#
+# Build it once (needs `pip install Cython` + MSVC):
+#     cd native && ../.venv/Scripts/python.exe setup_cython.py build_ext --inplace
+# If the compiled module isn't present, this test skips.
+
+async def test_cython_nogil_releases_gil_so_threads_parallelize() -> None:
+    import sys
+    from pathlib import Path
+
+    native_dir = Path(__file__).resolve().parent.parent / "native"
+    if str(native_dir) not in sys.path:
+        sys.path.insert(0, str(native_dir))
+
+    sum_squares_cy = pytest.importorskip(
+        "sum_squares_cy",
+        reason="build it: cd native && python setup_cython.py build_ext --inplace",
+    )
+
+    n = 200_000
+    results = await asyncio.gather(
+        *(asyncio.to_thread(sum_squares_cy.sum_squares, n) for _ in range(4))
+    )
+
+    expected = (n - 1) * n * (2 * n - 1) // 6
+    assert results == [expected] * 4

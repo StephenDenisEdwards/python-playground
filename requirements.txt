@@ -2,3 +2,4 @@ pytest>=8.0
 pytest-asyncio>=0.23
 numpy>=1.26        # used by the §11 GIL-release-via-threads example
 setuptools>=68     # only to BUILD the §12 native C extension (native/setup.py)
+Cython>=3.0        # only to BUILD the §13 Cython extension (native/setup_cython.py)

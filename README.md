@@ -23,23 +23,28 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Optional: build the native C extension (§12)
+## Optional: build the native extensions (§12, §13)
 
-`test_07_async.py` §12 demonstrates a hand-written CPython C extension that
-releases the GIL (the same technique numpy uses). It must be **compiled** before
-that test will run — it requires a C compiler (on Windows, the **MSVC "Desktop
-development with C++"** workload; `setuptools` locates it automatically, so no
-Developer Command Prompt is needed):
+`test_07_async.py` §12 and §13 demonstrate releasing the GIL from compiled code
+(the same technique numpy uses), so CPU-heavy work parallelizes across threads:
+
+- **§12** — a hand-written CPython C extension (`native/native_demo.c`)
+- **§13** — the same loop in Cython (`native/sum_squares_cy.pyx`)
+
+Both must be **compiled** before their tests will run. They require a C compiler
+(on Windows, the **MSVC "Desktop development with C++"** workload; `setuptools`
+locates it automatically, so no Developer Command Prompt is needed):
 
 ```powershell
 cd native
-..\.venv\Scripts\python.exe setup.py build_ext --inplace
+..\.venv\Scripts\python.exe setup.py build_ext --inplace          # §12 (C)
+..\.venv\Scripts\python.exe setup_cython.py build_ext --inplace   # §13 (Cython)
 cd ..
 ```
 
-If you skip this step, that single test is **skipped** (not failed) — every other
-test runs normally. The compiled binary is git-ignored, so each clone builds its
-own.
+If you skip a build, that single test is **skipped** (not failed) — every other
+test runs normally. The compiled binaries are git-ignored, so each clone builds
+its own.
 
 ## Running the tests
 
