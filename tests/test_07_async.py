@@ -445,3 +445,43 @@ async def test_timeout_cancels_a_slow_operation() -> None:
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.01):
             await fetch_value(1.0, "too slow")
+
+
+# ---------------------------------------------------------------------------
+# 11. Handling a CPU-bound worker (the practical pattern)
+# ---------------------------------------------------------------------------
+# §9 proved processes give real parallelism. This is the shape of an actual
+# worker. Two rules beyond "use a process pool":
+#   1. Create the pool ONCE and reuse it. Here it's scoped to the test; in a
+#      real app you'd build it at startup, not per request — spawning is costly.
+#   2. Split the work into BATCHES. Crossing the process boundary pickles the
+#      args and results, and each process is a fresh interpreter, so make each
+#      unit of work big enough that the compute dwarfs that overhead. Don't
+#      hand a process one tiny item at a time.
+#
+# Escape hatch (not shown — needs numpy): if the heavy work lives inside a C
+# extension that releases the GIL (numpy, pandas, hashing/compression libs),
+# then THREADS parallelize it too, and asyncio.to_thread is fine — no pickling,
+# no process startup. Processes are only required for pure-Python CPU loops.
+
+def crunch_batch(numbers: list[int]) -> tuple[int, int]:
+    """CPU-bound work over a batch. Returns (worker pid, partial sum of squares)."""
+    return os.getpid(), sum(n * n for n in numbers)
+
+
+async def test_cpu_bound_worker_batches_across_processes() -> None:
+    data = list(range(1, 1001))
+    batch_size = 250
+    batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+
+    loop = asyncio.get_running_loop()
+    # One pool, reused for every batch. run_in_executor keeps the event loop
+    # free to await other coroutines while the processes crunch.
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        partials = await asyncio.gather(
+            *(loop.run_in_executor(pool, crunch_batch, batch) for batch in batches)
+        )
+
+    total = sum(result for _, result in partials)
+    assert total == sum(n * n for n in data)             # batches recombine to the whole
+    assert all(pid != os.getpid() for pid, _ in partials)  # all ran off the main process

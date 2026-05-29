@@ -281,6 +281,111 @@ async with asyncio.timeout(0.01):   # 3.11+; raises TimeoutError
 
 ---
 
+## 11. Handling a CPU-bound worker
+
+§9 proved that processes give real parallelism. This is the shape of an actual worker, plus the practical rules that decide whether it performs well.
+
+**Step 1 — never run it inline.** A CPU-bound call in a coroutine freezes the whole event loop (the §8 footgun):
+
+```python
+async def handler(data):
+    result = heavy_compute(data)   # ❌ blocks every other task until it returns
+```
+
+**Step 2 — don't use threads either.** `to_thread` / `ThreadPoolExecutor` give *no* CPU speedup for pure-Python work — the GIL serializes them (see the full explanation below):
+
+```python
+result = await asyncio.to_thread(heavy_compute, data)   # ❌ no parallelism for CPU work
+```
+
+**Step 3 — offload to a process pool, awaited from async code:**
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+# Create the pool ONCE (app startup), not per request — spawning is expensive.
+pool = ProcessPoolExecutor(max_workers=os.cpu_count())
+
+async def handler(data):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(pool, heavy_compute, data)  # ✓ loop stays free
+```
+
+If you're **not** in async code at all, use the pool directly — the `Parallel.ForEach` equivalent:
+
+```python
+with ProcessPoolExecutor() as pool:
+    results = list(pool.map(heavy_compute, items))
+```
+
+### The rules that make a worker actually perform
+
+- **Create the pool once and reuse it.** Building a pool per request is a common performance bug — each process is a fresh interpreter.
+- **Batch the work.** Arguments and results cross the process boundary via `pickle`, so make each unit of work big enough that the compute dwarfs the transfer. `pool.map(fn, items, chunksize=N)` helps; or split the data into batches yourself (see the test `test_cpu_bound_worker_batches_across_processes`).
+- **Picklable in, picklable out.** The worker must be a **module-level** function (no lambdas/nested defs) and the data must be picklable — this is the same Windows `spawn` caveat from §9.
+- **Bounded by cores, not threads.** `max_workers=os.cpu_count()` is the usual ceiling; more processes than cores just adds context-switching.
+
+### The escape hatch: native libraries that release the GIL
+
+If the heavy work is inside a C/Fortran library — **NumPy, Pandas, SciPy, Polars, image/crypto/compression libs** — those release the GIL during their inner loops. Then **threads parallelize that work**, and `to_thread` / `ThreadPoolExecutor` become viable again with none of the pickling or process-startup cost:
+
+```python
+# numpy releases the GIL inside the matmul, so threads run truly in parallel:
+await asyncio.to_thread(numpy_heavy_matrix_op, big_array)
+```
+
+So the rule is: **pure-Python CPU loop → processes; CPU loop inside a GIL-releasing native lib → threads are fine.**
+
+### Decision table
+
+| Situation | Use |
+|---|---|
+| I/O-bound (network, disk, DB) | `asyncio` / `to_thread` / `ThreadPoolExecutor` |
+| CPU-bound, pure Python | `ProcessPoolExecutor` + `run_in_executor` |
+| CPU-bound inside NumPy/Pandas/native | threads / `to_thread` (GIL is released) |
+| CPU-bound, no async app at all | `ProcessPoolExecutor.map` or `multiprocessing` |
+
+---
+
+## The GIL (Global Interpreter Lock) — in full
+
+The **GIL** is a single mutex inside the CPython interpreter that allows **only one thread to execute Python bytecode at a time**, per process. Even on a 16-core machine, your Python threads take turns holding that one lock; only the holder runs Python code.
+
+### The C# contrast
+
+There's nothing like it in .NET. In C#, 16 threads can genuinely run C# code on 16 cores at once — the runtime just makes you responsible for protecting shared state with `lock`. Python flips that: the interpreter holds one big lock *for* you, so two threads simply can't run Python simultaneously in the first place.
+
+```
+C# threads:     [core0: T1] [core1: T2] [core2: T3]   ← all running at once
+Python threads: [core0: T1] ... T2 waits ... T3 waits  ← one at a time, taking turns
+```
+
+### Why it exists
+
+CPython manages memory with **reference counting**, which isn't thread-safe — every object's refcount is incremented/decremented constantly, and making each of those operations individually thread-safe would be slow and complex. The GIL is the cheap shortcut: protect the *entire* interpreter with one lock instead. It also makes writing C extensions far simpler. It's a **CPython implementation detail**, not part of the language spec — Jython and IronPython have no GIL.
+
+### When the GIL is released (why it's not as bad as it sounds)
+
+1. **During blocking I/O.** A thread waiting on a socket, disk, or `time.sleep` drops the GIL so another thread can run. → **I/O-bound threading works fine.**
+2. **Inside many C extensions.** NumPy, Pandas, hashing/compression libraries, etc. release the GIL during their heavy C loops. → threads parallelize *that* work.
+
+It only hurts **CPU-bound pure-Python code**, where threads are stuck taking turns on one core:
+
+| Workload | Threads help? |
+|---|---|
+| I/O-bound (network, disk, DB) | ✅ yes — GIL released while blocked |
+| CPU-bound in a native lib (NumPy) | ✅ yes — GIL released in C |
+| CPU-bound pure Python | ❌ no — serialized by the GIL |
+
+### How it connects to everything here
+
+- It's *why* `asyncio` is single-threaded and cooperative — no point fighting for multiple threads when only one can run Python at once (§8).
+- It's *why* `to_thread` / `ThreadPoolExecutor` give no CPU speedup, and you reach for **processes** (§9, §11) — each process has its own interpreter and therefore its own GIL, so they truly run in parallel.
+
+**Forward-looking note:** Python 3.13+ ships an experimental **free-threaded ("no-GIL") build** (PEP 703), where threads can run Python in parallel like C#'s. It's opt-in and not yet the default, so everything above still applies to the interpreter you're running.
+
+---
+
 ## Common pitfalls
 
 ### Forgetting to `await`
