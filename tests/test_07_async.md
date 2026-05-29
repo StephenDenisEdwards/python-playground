@@ -349,6 +349,51 @@ So the rule is: **pure-Python CPU loop → processes; CPU loop inside a GIL-rele
 
 ---
 
+## 12. Writing your own CPU-heavy C function (how numpy does it)
+
+The numpy escape hatch in §11 works because numpy's heavy loops are written in C and **release the GIL**. You can do the same with your own code. `native/native_demo.c` is a real CPython C extension whose hot loop is wrapped in the GIL-releasing macros:
+
+```c
+static PyObject *sum_squares(PyObject *self, PyObject *args) {
+    long long n, total = 0;
+    if (!PyArg_ParseTuple(args, "L", &n)) return NULL;
+
+    Py_BEGIN_ALLOW_THREADS          /* drop the GIL — other threads may run */
+    for (long long i = 0; i < n; i++) total += i * i;
+    Py_END_ALLOW_THREADS            /* re-acquire before touching Python objects */
+
+    return PyLong_FromLongLong(total);
+}
+```
+
+Build it with MSVC (setuptools finds the compiler via `vswhere` — no Developer Command Prompt needed):
+
+```
+cd native
+../.venv/Scripts/python.exe setup.py build_ext --inplace
+```
+
+Then `test_c_extension_releases_gil_so_threads_parallelize` imports it and runs four calls across threads via `asyncio.to_thread` — they parallelize, because the GIL is dropped inside the loop. (The test skips if the module hasn't been built.) Drop the `Py_BEGIN/END_ALLOW_THREADS` macros and it would hold the GIL and behave like a pure-Python CPU loop — no parallelism.
+
+### How numpy is implemented, and the modern alternatives
+
+numpy's core is exactly this: a **hand-written CPython C extension** (`numpy._core._multiarray_umath`) that wraps its ufunc inner loops in `NPY_BEGIN_ALLOW_THREADS`. Linear algebra (`@`, `dot`, `solve`) delegates to an external **BLAS/LAPACK** library (OpenBLAS, MKL, Accelerate) that is often multithreaded internally. It's built and shipped as **precompiled wheels** (via `meson-python`), so `pip install numpy` never compiles on the user's machine.
+
+Hand-writing the raw C API is the most control but the most boilerplate. For **new** code, the commonly recommended tools are:
+
+| Tool | What it is | GIL release | C# analogy |
+|---|---|---|---|
+| **Cython** | Python-ish source → generated C | `with nogil:` | — |
+| **pybind11 / nanobind** | Bind existing **C++** | `py::gil_scoped_release` | C++/CLI wrapper |
+| **PyO3 + maturin** | Extension in **Rust** (polars, pydantic-core) | `Python::allow_threads` | — |
+| **ctypes / cffi** | Call an already-compiled shared library | auto-released during the call | **P/Invoke (`DllImport`)** |
+| **Numba** | JIT-compiles numeric Python at runtime | `@njit(nogil=True)` | RyuJIT, for numeric Python |
+| **raw CPython C API** | What numpy/CPython themselves use (`native_demo.c`) | manual `Py_BEGIN_ALLOW_THREADS` | a native CLR-aware component |
+
+Rule of thumb: wrapping an existing C lib → `ctypes`/`cffi`; new hot-loop code → **Cython** (or **Numba** for numeric, no build step); a new C++/Rust module → **pybind11/nanobind** or **PyO3**; plain array math → just use numpy/scipy.
+
+---
+
 ## The GIL (Global Interpreter Lock) — in full
 
 The **GIL** is a single mutex inside the CPython interpreter that allows **only one thread to execute Python bytecode at a time**, per process. Even on a 16-core machine, your Python threads take turns holding that one lock; only the holder runs Python code.

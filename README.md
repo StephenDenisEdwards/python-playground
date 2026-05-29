@@ -19,9 +19,27 @@ python -m venv .venv
 # 2. Activate it (PowerShell)
 .\.venv\Scripts\Activate.ps1
 
-# 3. Install dependencies (pytest + pytest-asyncio)
+# 3. Install dependencies (pytest, pytest-asyncio, numpy, setuptools)
 pip install -r requirements.txt
 ```
+
+## Optional: build the native C extension (§12)
+
+`test_07_async.py` §12 demonstrates a hand-written CPython C extension that
+releases the GIL (the same technique numpy uses). It must be **compiled** before
+that test will run — it requires a C compiler (on Windows, the **MSVC "Desktop
+development with C++"** workload; `setuptools` locates it automatically, so no
+Developer Command Prompt is needed):
+
+```powershell
+cd native
+..\.venv\Scripts\python.exe setup.py build_ext --inplace
+cd ..
+```
+
+If you skip this step, that single test is **skipped** (not failed) — every other
+test runs normally. The compiled binary is git-ignored, so each clone builds its
+own.
 
 ## Running the tests
 

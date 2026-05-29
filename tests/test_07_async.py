@@ -520,3 +520,41 @@ async def test_numpy_releases_gil_so_threads_parallelize() -> None:
 
     expected = 256 * (256 * 1.0 * 2.0) * 256
     assert results == [expected] * 4       # correct results, computed off the loop
+
+
+# ---------------------------------------------------------------------------
+# 12. Your OWN CPU-heavy C function — how numpy actually does it
+# ---------------------------------------------------------------------------
+# native/native_demo.c is a real CPython C extension. Its hot loop is wrapped in
+# Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS, which RELEASE the GIL — the same
+# technique numpy uses internally. Because the GIL is dropped during the loop,
+# this parallelizes across plain THREADS (asyncio.to_thread), with no processes
+# and no pickling — unlike a pure-Python CPU loop (§9), which can't.
+#
+# Build it once (setuptools locates MSVC automatically, no Dev Prompt needed):
+#     cd native && ../.venv/Scripts/python.exe setup.py build_ext --inplace
+# If the compiled module isn't present, this test skips.
+
+async def test_c_extension_releases_gil_so_threads_parallelize() -> None:
+    import sys
+    from pathlib import Path
+
+    native_dir = Path(__file__).resolve().parent.parent / "native"
+    if str(native_dir) not in sys.path:
+        sys.path.insert(0, str(native_dir))
+
+    native_demo = pytest.importorskip(
+        "native_demo",
+        reason="build it: cd native && python setup.py build_ext --inplace",
+    )
+
+    n = 200_000
+    results = await asyncio.gather(
+        asyncio.to_thread(native_demo.sum_squares, n),
+        asyncio.to_thread(native_demo.sum_squares, n),
+        asyncio.to_thread(native_demo.sum_squares, n),
+        asyncio.to_thread(native_demo.sum_squares, n),
+    )
+
+    expected = (n - 1) * n * (2 * n - 1) // 6     # closed form for sum(i*i), i<n
+    assert results == [expected] * 4
