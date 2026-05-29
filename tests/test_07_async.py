@@ -117,10 +117,32 @@ async def test_cancellation_runs_cleanup_via_finally() -> None:
     assert events == ["acquired", "released"]   # ...and cleanup happened first
 
     # If you need cancellation-SPECIFIC cleanup, catch it explicitly — but then
-    # you MUST re-raise, or the cancellation silently fails:
-    #     except asyncio.CancelledError:
-    #         await rollback()
-    #         raise
+    # you MUST re-raise, or the cancellation silently fails (see next test).
+
+
+# The except+re-raise variant. Use this when cleanup is specific to cancellation
+# (e.g. a rollback). Catching CancelledError gives you the handling hook; the
+# bare `raise` re-throws the SAME exception so cancellation still propagates.
+# Drop that `raise` and the coroutine would return normally — the cancellation
+# would be silently swallowed, which is almost always a bug.
+
+async def test_cancellation_catch_and_reraise() -> None:
+    events: list[str] = []
+
+    async def worker() -> None:
+        try:
+            await asyncio.sleep(10)            # parked here; cancel() lands at this await
+        except asyncio.CancelledError:
+            events.append("rolled back")        # cancellation-specific cleanup
+            raise                               # re-throw — do NOT swallow it
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)                       # let worker reach the await
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task                               # the re-raised error propagates here
+    assert events == ["rolled back"]             # the except block ran before re-raising
 
 
 # ---------------------------------------------------------------------------
