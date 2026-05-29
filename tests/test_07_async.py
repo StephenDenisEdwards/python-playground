@@ -145,6 +145,32 @@ async def test_cancellation_catch_and_reraise() -> None:
     assert events == ["rolled back"]             # the except block ran before re-raising
 
 
+# THE BUG: catch CancelledError and DON'T re-raise. The coroutine then returns
+# normally, so asyncio treats the task as having completed successfully — the
+# cancellation request is silently ignored. await returns a value instead of
+# raising, and task.cancelled() is False. This is almost never what you want.
+
+async def test_swallowing_cancellation_defeats_it() -> None:
+    events: list[str] = []
+
+    async def worker() -> str:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            events.append("swallowed")          # caught it...
+            # ...and (the bug) never re-raised. Compare the `raise` above.
+        return "completed anyway"
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)                       # let worker reach the await
+    task.cancel()                                # we ASK to cancel...
+
+    result = await task                          # ...but no CancelledError is raised
+    assert result == "completed anyway"          # the task ran to completion
+    assert task.cancelled() is False             # cancellation did NOT take effect
+    assert events == ["swallowed"]
+
+
 # ---------------------------------------------------------------------------
 # 5. Running blocking (sync) work without freezing the loop
 # ---------------------------------------------------------------------------
