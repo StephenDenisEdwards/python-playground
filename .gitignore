@@ -12,7 +12,10 @@ venv/
 env/
 
 # IDE
-.vscode/
+.vscode/*
+# ...but share the project's test/debug config:
+!.vscode/settings.json
+!.vscode/launch.json
 .idea/
 
 # OS

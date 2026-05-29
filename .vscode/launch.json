@@ -1,0 +1,27 @@
+{
+    // F5 launch configs. The pytest Test Explorer gutter arrows still work
+    // independently; these are for debugging via the Run and Debug panel.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // Debug just the file currently focused in the editor.
+            "name": "Pytest: current file",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["${file}"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            // Debug the whole tests/ suite.
+            "name": "Pytest: all tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["tests"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
