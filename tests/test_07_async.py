@@ -65,12 +65,18 @@ async def test_gather_runs_concurrently() -> None:
 # ---------------------------------------------------------------------------
 # 3. create_task — fire-and-track, like Task.Run
 # ---------------------------------------------------------------------------
+# create_task SCHEDULES a (cold) coroutine on the loop and hands back a Task
+# handle — the "make it hot" step, like C#'s `Task<T> t = FooAsync();`.
 
 async def test_create_task() -> None:
+    # Schedule it now, get a handle back without blocking.
     task = asyncio.create_task(fetch_value(0.01, 7))
-    # ... do other work here while the task runs ...
-    result = await task
+    # ... do other work here; the task interleaves whenever we hit an await ...
+    result = await task          # suspend until done, then unwrap the value (7)
     assert result == 7
+    # Keep the `task` reference: a discarded task can be garbage-collected
+    # mid-flight and silently stop. For just one result, plain `await
+    # fetch_value(...)` is simpler; use create_task when you need the handle.
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +88,39 @@ async def test_create_task() -> None:
 async def test_task_cancellation() -> None:
     task = asyncio.create_task(asyncio.sleep(10))
     task.cancel()
-    import pytest
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# A coroutine doesn't need to "support" cancellation to be interruptible, but if
+# it holds a resource it should release it on the way out. A try/finally does
+# this for ANY exit — normal return, error, OR cancellation. Because we never
+# *catch* CancelledError here, it can't be accidentally swallowed: it propagates
+# automatically once the finally block has run.
+
+async def test_cancellation_runs_cleanup_via_finally() -> None:
+    events: list[str] = []
+
+    async def worker() -> None:
+        events.append("acquired")          # e.g. open a connection / take a lock
+        try:
+            await asyncio.sleep(10)         # parked here; cancel() lands at this await
+        finally:
+            events.append("released")       # cleanup runs even when cancelled
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)                   # let worker start and reach the await
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task                           # CancelledError still propagates...
+    assert events == ["acquired", "released"]   # ...and cleanup happened first
+
+    # If you need cancellation-SPECIFIC cleanup, catch it explicitly — but then
+    # you MUST re-raise, or the cancellation silently fails:
+    #     except asyncio.CancelledError:
+    #         await rollback()
+    #         raise
 
 
 # ---------------------------------------------------------------------------
