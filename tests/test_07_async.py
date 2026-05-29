@@ -24,6 +24,8 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # 1. A basic async function
@@ -223,3 +225,139 @@ async def test_processpool_gives_real_parallelism() -> None:
     # this in THIS process, bottlenecked on the one GIL.
     assert pid_a != os.getpid()
     assert pid_b != os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# 10. Translating the rest of the C# async toolbox
+# ---------------------------------------------------------------------------
+# The idioms above cover WhenAll (gather), Task.Run (create_task / executors)
+# and CancellationToken (task.cancel). Here are the remaining ones a C# dev
+# reaches for, each mapped to its asyncio equivalent.
+
+
+# --- 10a. Task.WhenAny --------------------------------------------------------
+# C#:  Task winner = await Task.WhenAny(t1, t2);
+# Python: asyncio.wait with return_when=FIRST_COMPLETED gives you the finished
+# set and the still-pending set. Cancel the stragglers yourself.
+
+async def test_when_any_first_completed() -> None:
+    fast = asyncio.create_task(fetch_value(0.01, "fast"))
+    slow = asyncio.create_task(fetch_value(1.00, "slow"))
+
+    done, pending = await asyncio.wait(
+        {fast, slow}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    assert fast in done and slow in pending
+    assert fast.result() == "fast"
+
+    for task in pending:                 # don't leak the loser — cancel it
+        task.cancel()
+
+
+# --- 10b. Streaming results as they finish -----------------------------------
+# C# has no direct WhenEach until recent versions; asyncio.as_completed yields
+# awaitables in *completion* order (not submission order), so you can process
+# each result the moment it's ready.
+
+async def test_as_completed_yields_in_finish_order() -> None:
+    order: list[str] = []
+    coros = [
+        fetch_value(0.03, "c"),
+        fetch_value(0.01, "a"),
+        fetch_value(0.02, "b"),
+    ]
+    for finished in asyncio.as_completed(coros):
+        order.append(await finished)
+
+    # Sorted by delay, regardless of the order we submitted them.
+    assert order == ["a", "b", "c"]
+
+
+# --- 10c. TaskGroup ≈ a stricter Task.WhenAll --------------------------------
+# C#:  await Task.WhenAll(t1, t2);
+# asyncio.TaskGroup (3.11+) is structured concurrency: all tasks are awaited at
+# block exit, AND if any one raises, the siblings are cancelled automatically.
+# WhenAll lets the others keep running after the first fault; TaskGroup doesn't.
+
+async def test_taskgroup_awaits_all_children() -> None:
+    async with asyncio.TaskGroup() as tg:
+        t1 = tg.create_task(fetch_value(0.01, 1))
+        t2 = tg.create_task(fetch_value(0.02, 2))
+    # Outside the block both are guaranteed complete.
+    assert (t1.result(), t2.result()) == (1, 2)
+
+
+async def test_taskgroup_cancels_siblings_on_failure() -> None:
+    sibling_cancelled = False
+
+    async def faulty() -> None:
+        raise ValueError("boom")
+
+    async def long_sibling() -> None:
+        nonlocal sibling_cancelled
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            sibling_cancelled = True       # the group cancelled us
+            raise
+
+    # A failure inside the group surfaces as an ExceptionGroup (3.11+), which is
+    # the moral equivalent of C#'s AggregateException.
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(long_sibling())
+            tg.create_task(faulty())
+
+    assert sibling_cancelled is True
+    assert any(isinstance(e, ValueError) for e in excinfo.value.exceptions)
+
+
+# --- 10d. TaskCompletionSource<T> → a Future ---------------------------------
+# C#:  var tcs = new TaskCompletionSource<int>(); ... tcs.SetResult(42);
+# Python: a Future is a settable awaitable you complete from elsewhere — handy
+# for bridging callback-based APIs into async/await.
+
+async def test_future_as_task_completion_source() -> None:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int] = loop.create_future()
+
+    # Simulate an external callback completing the future a bit later.
+    def on_done() -> None:
+        future.set_result(42)
+
+    loop.call_later(0.01, on_done)         # like a timer firing the callback
+
+    result = await future                  # suspends until set_result is called
+    assert result == 42
+
+
+# --- 10e. Bounded concurrency (Parallel.ForEachAsync MaxDegreeOfParallelism) --
+# C#:  new ParallelOptions { MaxDegreeOfParallelism = 2 }
+# Python: a Semaphore caps how many coroutines hold the resource at once.
+
+async def test_semaphore_bounds_concurrency() -> None:
+    in_flight = 0
+    peak = 0
+    sem = asyncio.Semaphore(2)             # at most 2 running at a time
+
+    async def worker() -> None:
+        nonlocal in_flight, peak
+        async with sem:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+
+    await asyncio.gather(*(worker() for _ in range(6)))
+    assert peak == 2                       # never more than the semaphore allows
+
+
+# --- 10f. Timeouts (CancellationTokenSource.CancelAfter) ---------------------
+# C#:  cts.CancelAfter(TimeSpan.FromMilliseconds(10));
+# Python: asyncio.timeout (3.11+) cancels the block and raises TimeoutError.
+
+async def test_timeout_cancels_a_slow_operation() -> None:
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await fetch_value(1.0, "too slow")

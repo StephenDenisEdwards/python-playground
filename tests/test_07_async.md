@@ -32,6 +32,11 @@ The upshot: **async in Python is for I/O concurrency, not CPU parallelism.** For
 | `Task.Delay(ms)` | `asyncio.sleep(seconds)` |
 | `CancellationToken` | `asyncio.Task.cancel()` raises `CancelledError` |
 | `Task.WhenAny` | `asyncio.wait(..., return_when=FIRST_COMPLETED)` |
+| `Task.WhenAll` (strict) | `asyncio.TaskGroup()` (3.11+) |
+| `TaskCompletionSource<T>` | `loop.create_future()` |
+| `Parallel.ForEachAsync` (MaxDOP) | `asyncio.Semaphore(n)` |
+| `cts.CancelAfter(...)` | `asyncio.timeout(...)` (3.11+) / `wait_for` |
+| `AggregateException` | `ExceptionGroup` (3.11+) |
 | `await foo()` | `await foo()` ✓ same |
 
 ---
@@ -133,6 +138,149 @@ result = await asyncio.to_thread(blocking_compute, 6)
 
 ---
 
+## 6. Coroutines are "cold"; C# Tasks are "hot"
+
+The first thing that bites a C# dev. In C#, calling an async method **starts** it:
+
+```csharp
+Task<int> t = FetchAsync();   // already running on the thread pool
+int x = await t;              // await just collects the result
+```
+
+In Python, calling an `async def` runs **none** of the body — it builds an inert coroutine object that does nothing until you `await` it (or schedule it):
+
+```python
+coro = record()      # body has NOT run
+await coro           # NOW it runs
+```
+
+Forget to `await` and you get a `RuntimeWarning: coroutine was never awaited` and zero work done.
+
+---
+
+## 7. `create_task` is "hot" — but cooperative
+
+`asyncio.create_task(coro)` is the closest thing to a C# hot `Task`: it *schedules* the coroutine. But on a single thread it still doesn't run on the calling line — it runs only when the current coroutine next yields control:
+
+```python
+task = asyncio.create_task(record())
+# body has NOT run yet — we haven't yielded
+await asyncio.sleep(0)        # yield once; the loop now runs the task
+# body has run
+```
+
+Nothing else runs until *you* step aside at an `await`.
+
+---
+
+## 8. Single-threaded + cooperative: interleaving only at `await`
+
+In C# the runtime can resume continuations on thread-pool threads, so work interleaves "for free". In Python everything is on one thread, and a coroutine runs uninterrupted until it hits an `await` — the only point another coroutine can step in.
+
+```python
+async def worker(name):
+    log.append(f"{name}-start")
+    await asyncio.sleep(0.01)     # yields; the other worker gets a turn
+    log.append(f"{name}-end")
+
+await asyncio.gather(worker("A"), worker("B"))
+# -> A-start, B-start, A-end, B-end   (interleaved)
+```
+
+Swap `asyncio.sleep` for a synchronous `time.sleep` and the order becomes `A-start, A-end, B-start, B-end` — `time.sleep` never yields, so A monopolises the single thread. **This is the #1 async Python footgun:** one stray blocking call silently serializes everything. In C# the same blocking call only ties up one thread-pool thread.
+
+---
+
+## 9. Real CPU parallelism: processes, not threads
+
+`asyncio.to_thread` is useless for CPU-bound work — the GIL lets only one thread run Python bytecode at a time. For genuine multi-core parallelism (what C#'s `Task.Run` gives you on the thread pool) you spawn separate *processes*, each with its own interpreter and GIL:
+
+```python
+loop = asyncio.get_running_loop()
+with ProcessPoolExecutor(max_workers=2) as pool:
+    a, b = await asyncio.gather(
+        loop.run_in_executor(pool, cpu_bound, 50_000),
+        loop.run_in_executor(pool, cpu_bound, 50_000),
+    )
+```
+
+The test proves it by checking each worker's `os.getpid()` differs from the main process. **Windows caveat:** `multiprocessing` uses `spawn`, which re-imports the module and pickles the worker by name — so the worker must be a module-level function, never a nested function or lambda.
+
+---
+
+## 10. Translating the rest of the C# async toolbox
+
+The sections above cover `WhenAll` (`gather`), `Task.Run` (`create_task` / executors) and `CancellationToken` (`task.cancel()`). Here are the remaining idioms.
+
+### `Task.WhenAny` — first to finish wins
+
+```python
+done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+winner = done.pop().result()
+for t in pending:
+    t.cancel()              # don't leak the losers
+```
+
+### Process results as they complete
+
+`asyncio.as_completed` yields awaitables in **completion** order, not submission order:
+
+```python
+for finished in asyncio.as_completed(coros):
+    result = await finished     # whichever finished first
+```
+
+### `TaskGroup` ≈ a stricter `WhenAll`
+
+`asyncio.TaskGroup` (3.11+) is structured concurrency: all children are awaited at block exit, **and if one raises, the siblings are cancelled automatically**. `WhenAll` lets the others keep running after the first fault; `TaskGroup` doesn't.
+
+```python
+async with asyncio.TaskGroup() as tg:
+    t1 = tg.create_task(fetch(1))
+    t2 = tg.create_task(fetch(2))
+# both guaranteed complete here; t1.result(), t2.result()
+```
+
+A failure surfaces as an `ExceptionGroup` (the moral equivalent of C#'s `AggregateException`), caught with `except*` or asserted via `BaseExceptionGroup`.
+
+### `TaskCompletionSource<T>` → a `Future`
+
+A settable awaitable you complete from elsewhere — handy for bridging callback APIs into async/await:
+
+```python
+future = asyncio.get_running_loop().create_future()
+# later, from a callback:
+future.set_result(42)
+value = await future            # suspends until set_result
+```
+
+### Bounded concurrency (`MaxDegreeOfParallelism`)
+
+A `Semaphore` caps how many coroutines run at once:
+
+```python
+sem = asyncio.Semaphore(2)      # at most 2 in flight
+async def worker(x):
+    async with sem:
+        return await do_work(x)
+await asyncio.gather(*(worker(x) for x in items))
+```
+
+### Timeouts (`CancellationTokenSource.CancelAfter`)
+
+```python
+async with asyncio.timeout(0.01):   # 3.11+; raises TimeoutError
+    await slow_op()
+# pre-3.11 / single awaitable: await asyncio.wait_for(slow_op(), 0.01)
+```
+
+### The non-equivalents
+
+- **`ConfigureAwait(false)`** — irrelevant in Python. There's no captured `SynchronizationContext`; continuations always resume on the loop thread.
+- **Hot-by-default `Task`** — Python coroutines are cold (§6); `create_task` is the opt-in.
+
+---
+
 ## Common pitfalls
 
 ### Forgetting to `await`
@@ -180,8 +328,15 @@ if __name__ == "__main__":
 | Wait for all | `await Task.WhenAll(...)` | `await asyncio.gather(...)` |
 | Wait for first | `await Task.WhenAny(...)` | `asyncio.wait(..., return_when=FIRST_COMPLETED)` |
 | Schedule without awaiting | `Task.Run(...)` | `asyncio.create_task(...)` |
+| Wait for all (strict, cancel-on-fault) | — | `async with asyncio.TaskGroup()` |
+| Results in finish order | `Task.WhenEach(...)` | `asyncio.as_completed(...)` |
+| Settable awaitable | `TaskCompletionSource<T>` | `loop.create_future()` |
+| Cap concurrency | `MaxDegreeOfParallelism` | `asyncio.Semaphore(n)` |
+| Timeout | `cts.CancelAfter(ms)` | `async with asyncio.timeout(s)` |
+| Aggregated failures | `AggregateException` | `ExceptionGroup` |
 | Async delay | `Task.Delay(ms)` | `asyncio.sleep(seconds)` |
 | Cancel | `cts.Cancel()` | `task.cancel()` |
 | Run sync work asynchronously | `Task.Run(() => Sync())` | `await asyncio.to_thread(sync, args)` |
+| Real CPU parallelism | `Task.Run(cpuWork)` | `run_in_executor(ProcessPoolExecutor(), ...)` |
 | Entry point | `static async Task Main()` | `asyncio.run(main())` |
 | Use case | I/O **and** CPU parallelism | I/O concurrency **only** |
