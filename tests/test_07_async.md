@@ -375,6 +375,45 @@ cd native
 
 Then `test_c_extension_releases_gil_so_threads_parallelize` imports it and runs four calls across threads via `asyncio.to_thread` — they parallelize, because the GIL is dropped inside the loop. (The test skips if the module hasn't been built.) Drop the `Py_BEGIN/END_ALLOW_THREADS` macros and it would hold the GIL and behave like a pure-Python CPU loop — no parallelism.
 
+### What `Py_BEGIN_ALLOW_THREADS` actually is
+
+It's a **macro pair**, not a function — defined in CPython's `ceval.h` (pulled in via `#include <Python.h>`). On this machine: `...\Python312\include\ceval.h`. The definitions:
+
+```c
+#define Py_BEGIN_ALLOW_THREADS { \
+                        PyThreadState *_save; \
+                        _save = PyEval_SaveThread();
+#define Py_BLOCK_THREADS        PyEval_RestoreThread(_save);
+#define Py_UNBLOCK_THREADS      _save = PyEval_SaveThread();
+#define Py_END_ALLOW_THREADS    PyEval_RestoreThread(_save); \
+                 }
+```
+
+Note the deliberately **unbalanced braces**: `BEGIN` opens a `{` block and declares `_save`; `END` closes it. So `sum_squares`'s loop expands to:
+
+```c
+{
+    PyThreadState *_save;
+    _save = PyEval_SaveThread();              // release the GIL, stash thread state
+    for (long long i = 0; i < n; i++) total += i * i;
+    PyEval_RestoreThread(_save);              // re-acquire the GIL, restore state
+}
+```
+
+The two real functions:
+- **`PyEval_SaveThread()`** — releases the GIL and returns the current `PyThreadState*` so it can be restored. After this, other threads may run Python.
+- **`PyEval_RestoreThread(_save)`** — re-acquires the GIL (blocking until available) and restores the saved state.
+
+**Why a macro, not a function:** it must declare a local (`_save`) that lives across the whole block in *your* function's scope — a function call can't do that. The braces also scope `_save` so it can't collide with your locals, which is why the header warns: **never nest** a `BEGIN`/`END` pair (the inner `_save` would shadow the outer).
+
+**Early exit:** because the block is braced, you can't `return` from the middle without re-acquiring the GIL first — anything touching Python objects (including raising an exception) needs the GIL. Use `Py_BLOCK_THREADS` to grab it back before bailing out. `sum_squares` touches no Python objects inside the block and can't fail, so the plain `BEGIN`/`END` pair is correct.
+
+**To resolve it yourself:** read the header above, or preprocess the source with MSVC to see the expansion in context (`.i` = preprocessed, not compiled):
+
+```
+cl /P /I"<python-include-dir>" native\native_demo.c   # then open native_demo.i, search for _save
+```
+
 ### How numpy is implemented, and the modern alternatives
 
 numpy's core is exactly this: a **hand-written CPython C extension** (`numpy._core._multiarray_umath`) that wraps its ufunc inner loops in `NPY_BEGIN_ALLOW_THREADS`. Linear algebra (`@`, `dot`, `solve`) delegates to an external **BLAS/LAPACK** library (OpenBLAS, MKL, Accelerate) that is often multithreaded internally. It's built and shipped as **precompiled wheels** (via `meson-python`), so `pip install numpy` never compiles on the user's machine.
